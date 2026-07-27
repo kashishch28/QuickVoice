@@ -22,6 +22,7 @@ from handlers.livekit_handler import recording_path as build_recording_path, sta
 from handlers.live_transcript_publisher import LiveTranscriptPublisher
 from handlers.http_tool_handler import build_http_tool_instructions, call_http_tool, parse_http_tool_arguments
 from handlers.mcp_handler import build_mcp_tool_instructions, call_mcp_tool, parse_arguments_json
+from handlers.observability_handler import CallTraceRecorder
 from handlers.privacy_handler import should_store_call_audio
 from handlers.rag_handler import RagRetrievalError, get_rag_context
 from handlers.transcript_collector import TranscriptCollector
@@ -260,6 +261,16 @@ def run_combined_server() -> int:
         stop_children()
 
 
+def _find_evaluated_item(data_evaluated: Any, identifier: str) -> dict[str, Any] | None:
+    if not isinstance(data_evaluated, list):
+        return None
+    normalized = str(identifier or "").strip().lower()
+    for item in data_evaluated:
+        if isinstance(item, dict) and str(item.get("identifier") or "").strip().lower() == normalized:
+            return item
+    return None
+
+
 class Assistant(Agent):
     def __init__(
         self,
@@ -267,6 +278,7 @@ class Assistant(Agent):
         config: dict,
         call_context: dict,
         transcript_collector: TranscriptCollector | None = None,
+        call_trace_recorder: CallTraceRecorder | None = None,
     ):
         super().__init__(
             instructions=system_prompt,
@@ -276,6 +288,7 @@ class Assistant(Agent):
         self._call_context = call_context
         self._metadata_collector = CallMetadataCollector(config)
         self._transcript_collector = transcript_collector
+        self._call_trace_recorder = call_trace_recorder
 
     def _rag_enabled(self) -> bool:
         return bool(self._config.get("use_rag"))
@@ -367,7 +380,16 @@ class Assistant(Agent):
             identifier: The configured evaluation id or name.
             value: The evaluation result, such as true, false, yes, no, or a short label.
         """
-        return self._metadata_collector.record_evaluation(identifier, value)
+        result = self._metadata_collector.record_evaluation(identifier, value)
+        if self._call_trace_recorder is not None:
+            recorded = _find_evaluated_item(self._config.get("data_evaluated"), identifier)
+            if recorded is not None:
+                self._call_trace_recorder.record_evaluation(
+                    recorded["identifier"],
+                    recorded["value"],
+                    description=recorded.get("description") or None,
+                )
+        return result
 
     @function_tool
     async def search_knowledge_base(self, query: str, top_k: int = 5) -> str:
@@ -489,10 +511,16 @@ async def entrypoint(ctx: JobContext):
     if not call_context.get("provider") and config.get("provider"):
         call_context["provider"] = config["provider"]
 
+    # Opens a Langfuse trace for this call. A no-op unless LANGFUSE_ENABLED is
+    # set; never raises, so a missing/misconfigured observability backend
+    # can't affect call setup.
+    call_trace_recorder = CallTraceRecorder(call_context=call_context, config=config)
+
     try:
         provider_kwargs = build_session_provider_kwargs(config)
     except ProviderAdapterError as error:
         logger.error("Voice provider adapter error: {}", redact_sensitive(str(error)))
+        call_trace_recorder.close(reason="provider_adapter_error")
         ctx.shutdown(reason=f"provider adapter error: {error}")
         return
 
@@ -514,6 +542,10 @@ async def entrypoint(ctx: JobContext):
         ivr_detection=config["ivr_navigation_enabled"],
         preemptive_generation=config.get("preemptive_generation", True),
     )
+    # Must attach to this exact llm object (the one actually wired into the
+    # session) since metrics_collected fires on the plugin instance, not on
+    # the session itself.
+    call_trace_recorder.attach(session, provider_kwargs["llm"])
     call_start_time = datetime.now(timezone.utc)
     live_transcript_publisher = LiveTranscriptPublisher(
         config=config,
@@ -531,6 +563,7 @@ async def entrypoint(ctx: JobContext):
         config=config,
         call_context=call_context,
         transcript_collector=transcript_collector,
+        call_trace_recorder=call_trace_recorder,
     )
 
     @ctx.room.on("data_received")
@@ -606,6 +639,11 @@ async def entrypoint(ctx: JobContext):
                 "[LIVE_TRANSCRIPT] Failed to close publisher: {}",
                 redact_sensitive(str(error)),
             )
+        # Unlike call-log finalization below, the trace is closed for preview
+        # calls too: previews are exactly where teams debug prompt/model
+        # behavior, so tracing them has value even though we intentionally
+        # never persist a call-log record for them.
+        call_trace_recorder.close(reason=shutdown_reason)
         if preview_mode:
             return
         try:
