@@ -208,6 +208,11 @@ For an end-to-end LiveKit smoke that joins the room, publishes probe audio, wait
 cd apps/ai
 .venv/bin/python scripts/phase2d_voice_smoke.py --env-file .env.dev
 ```
+## Langfuse Integration (this fork)
+
+This fork adds [Langfuse](https://github.com/langfuse/langfuse) call tracing to the `apps/ai` voice worker — every call gets traced turn-by-turn (prompts, completions, token usage, latency), respecting the existing `zero_pii_retention` privacy flag. Disabled by default; enable with `LANGFUSE_ENABLED=true` plus `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` in `apps/ai/.env.dev`.
+
+See [LANGFUSE.md](./LANGFUSE.md) for full details, setup, and verification steps.
 
 ## Stack
 
